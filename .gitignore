@@ -1,4 +1,4 @@
-schlieren_cv_videos/
+schlieren_cv_videos/*
 *.mp4
 *.avi
 *.mov
@@ -12,7 +12,7 @@ env/
 .vscode/
 .micropico
 
-schlieren_cv_images/
+schlieren_cv_images/*
 *.png
 !README_assets/*.png
 schlieren_ml/dataset/raw_sweeps/
