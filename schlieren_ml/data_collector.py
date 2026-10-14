@@ -5,7 +5,6 @@ import time
 import argparse
 import numpy as np
 import pandas as pd
-from collections import deque
 from datetime import datetime
 
 # Import Duet controller from parent directory
@@ -54,12 +53,18 @@ def detect_mirror_and_chamber(cap):
     return (cx, cy, rad), (x1, y1, x2, y2)
 
 def capture_temporal_burst(cap, chamber_bbox, center_x, num_frames=10):
-    """Captures N frames and computes Temporal Mean & Temporal Variance maps."""
+    """
+    Captures N frames after flushing stale USB buffers and settling vibrations.
+    Computes Temporal Mean & Temporal Variance maps.
+    """
     x1, y1, x2, y2 = chamber_bbox
     frames = []
     
-    for _ in range(2): cap.read()  # Flush buffer
-    
+    # 1. Flush stale frames from Windows DirectShow/USB buffer
+    for _ in range(6):
+        cap.grab()
+        
+    # 2. Grab consecutive crisp frames
     for _ in range(num_frames):
         ret, frame = cap.read()
         if not ret: break
@@ -78,7 +83,7 @@ def capture_temporal_burst(cap, chamber_bbox, center_x, num_frames=10):
     # Normalize variance map to 0-255 uint8 for saving
     var_norm = cv2.normalize(var_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     
-    # Compute classical Sobel-X score for comparison
+    # Compute classical Sobel-X score for reference
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     echamber = clahe.apply(mean_map)
     sx = cv2.Sobel(echamber, cv2.CV_64F, 1, 0, ksize=3)
@@ -88,30 +93,42 @@ def capture_temporal_burst(cap, chamber_bbox, center_x, num_frames=10):
     
     return mean_map, var_norm, classical_score
 
-def run_automated_sweep(duet, cap, chamber_bbox, mirror_geom, start_x, end_x, step_x):
+def run_automated_sweep(duet, cap, chamber_bbox, mirror_geom, start_x, end_x, step_x, condition_tag="default", sound_on=True):
     """Executes a calibrated motor sweep, recording video bursts at each position."""
     cx, cy, rad = mirror_geom
-    sweep_id = f"sweep_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    sound_str = "sound_on" if sound_on else "sound_off"
+    sweep_id = f"sweep_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{condition_tag}_{sound_str}"
     sweep_folder = os.path.join(PROCESSED_DIR, sweep_id)
     os.makedirs(sweep_folder, exist_ok=True)
     
-    print(f"\n[Sweep] Starting automated collection: {sweep_id}")
-    print(f"[Sweep] Moving to start position: {start_x:.3f} mm...")
+    print("\n" + "="*70)
+    print(f"--- SWEEP CONFIGURATION: {sweep_id} ---")
+    print(f"  Range:         {start_x:.3f} mm -> {end_x:.3f} mm (Step: {step_x:.3f} mm)")
+    print(f"  Condition:     {condition_tag}")
+    print(f"  Transducers:   {'ON (Standing Waves Expected)' if sound_on else 'OFF (Pure Heat Negatives)'}")
+    print("="*70)
+    print("Please set up your physical conditions now (adjust beam splitter, lights, or sound).")
+    input("Press [ENTER] when ready to start the sweep...")
+    
+    print(f"\n[Sweep] Moving motor to start position: {start_x:.3f} mm...")
     duet.move_x_absolute(start_x)
     duet.wait_for_move()
-    time.sleep(1.0)
+    time.sleep(0.8)
     
     records = []
     curr_x = start_x
     step_idx = 0
     
     cv2.namedWindow("Data Collector Live", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Data Collector Live", 800, 600)
+    cv2.resizeWindow("Data Collector Live", 800, 500)
     
     while curr_x <= end_x + 1e-4:
+        # Move motor to target position
         duet.move_x_absolute(curr_x)
         duet.wait_for_move()
-        time.sleep(0.2)
+        
+        # Settle vibration
+        time.sleep(0.25)
         
         sample_id = f"{sweep_id}_step_{step_idx:03d}"
         mean_img, var_img, classic_score = capture_temporal_burst(cap, chamber_bbox, cx, num_frames=10)
@@ -125,6 +142,8 @@ def run_automated_sweep(duet, cap, chamber_bbox, mirror_geom, start_x, end_x, st
         records.append({
             "sample_id": sample_id,
             "sweep_id": sweep_id,
+            "condition": condition_tag,
+            "sound_on": int(sound_on),
             "motor_x": round(curr_x, 3),
             "classical_score": round(classic_score, 1),
             "mean_path": mean_rel_path.replace("\\", "/"),
@@ -133,10 +152,13 @@ def run_automated_sweep(duet, cap, chamber_bbox, mirror_geom, start_x, end_x, st
         
         print(f"  Step {step_idx:02d} | X={curr_x:.3f} mm | Classic Score: {classic_score:.1f}")
         
-        # Display preview
+        # Display preview side-by-side
         preview = np.hstack([mean_img, var_img])
-        cv2.putText(preview, f"X: {curr_x:.3f} mm", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-        cv2.imshow("Data Collector Live", preview)
+        hud = np.zeros((40, preview.shape[1]), dtype=np.uint8)
+        cv2.putText(hud, f"X: {curr_x:.3f} mm | Condition: {condition_tag}", (10, 26), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, 255, 1)
+        preview_full = np.vstack([hud, preview])
+        cv2.imshow("Data Collector Live", preview_full)
         cv2.waitKey(1)
         
         curr_x += step_x
@@ -144,35 +166,40 @@ def run_automated_sweep(duet, cap, chamber_bbox, mirror_geom, start_x, end_x, st
         
     cv2.destroyAllWindows()
     
-    # Post-Sweep Sweet Spot Annotation
-    print("\n--- SWEEP COMPLETE ---")
-    best_classic = max(records, key=lambda r: r["classical_score"])
-    print(f"Classical score peak was at X = {best_classic['motor_x']:.3f} mm (Score: {best_classic['classical_score']:.1f})")
+    # --- GROUND TRUTH ANNOTATION ---
+    print("\n" + "="*70)
+    print("--- SWEEP COMPLETE: GROUND TRUTH ANNOTATION ---")
     
-    sweet_spot_input = input(f"Enter ground-truth sweet spot X (Press ENTER for {best_classic['motor_x']:.3f} mm): ").strip()
-    sweet_spot_x = float(sweet_spot_input) if sweet_spot_input else best_classic["motor_x"]
-    
-    print(f"Anchoring ground-truth Gaussian Quality curve to X* = {sweet_spot_x:.3f} mm...")
-    
-    # Calculate Quality score and Cutoff Regime labels
-    sigma = 0.12  # Bell-curve width in mm
-    for r in records:
-        dist = abs(r["motor_x"] - sweet_spot_x)
-        # Gaussian Quality in [0.0, 1.0]
-        q_score = float(np.exp(-(dist**2) / (2 * (sigma**2))))
-        r["quality_score"] = round(q_score, 4)
-        
-        # Regime Label: 0=Under-Cutoff, 1=Optimal, 2=Over-Cutoff
-        if r["motor_x"] < sweet_spot_x - 0.08:
+    if not sound_on:
+        # Transducers OFF: Every frame is a true negative (zero acoustic waves)
+        print("[Auto-Label] Transducers are OFF: All frames labeled as Negative (Quality = 0.0, Regime = Under/Over Cutoff)")
+        for r in records:
+            r["quality_score"] = 0.0
             r["regime_label"] = 0
-            r["regime_name"] = "Under-Cutoff"
-        elif r["motor_x"] > sweet_spot_x + 0.08:
-            r["regime_label"] = 2
-            r["regime_name"] = "Over-Cutoff"
-        else:
-            r["regime_label"] = 1
-            r["regime_name"] = "Optimal"
+            r["regime_name"] = "No-Sound-Negative"
+    else:
+        best_classic = max(records, key=lambda r: r["classical_score"])
+        print(f"Highest classical score observed at X = {best_classic['motor_x']:.3f} mm (Score: {best_classic['classical_score']:.1f})")
+        sweet_spot_input = input(f"Enter visual sweet spot X (Press ENTER for {best_classic['motor_x']:.3f} mm): ").strip()
+        sweet_spot_x = float(sweet_spot_input) if sweet_spot_input else best_classic["motor_x"]
+        
+        print(f"Anchoring Gaussian Quality curve to X* = {sweet_spot_x:.3f} mm...")
+        sigma = 0.12  # Standard deviation in mm
+        for r in records:
+            dist = abs(r["motor_x"] - sweet_spot_x)
+            q_score = float(np.exp(-(dist**2) / (2 * (sigma**2))))
+            r["quality_score"] = round(q_score, 4)
             
+            if r["motor_x"] < sweet_spot_x - 0.08:
+                r["regime_label"] = 0
+                r["regime_name"] = "Under-Cutoff"
+            elif r["motor_x"] > sweet_spot_x + 0.08:
+                r["regime_label"] = 2
+                r["regime_name"] = "Over-Cutoff"
+            else:
+                r["regime_label"] = 1
+                r["regime_name"] = "Optimal"
+                
     # Save/Append to manifest.csv
     new_df = pd.DataFrame(records)
     if os.path.exists(MANIFEST_PATH):
@@ -182,14 +209,22 @@ def run_automated_sweep(duet, cap, chamber_bbox, mirror_geom, start_x, end_x, st
         combined_df = new_df
         
     combined_df.to_csv(MANIFEST_PATH, index=False)
-    print(f"Saved {len(records)} samples to {MANIFEST_PATH}! (Total in dataset: {len(combined_df)})")
+    print(f"\n[Success] Added {len(records)} samples to {MANIFEST_PATH}!")
+    print(f"Total dataset size is now: {len(combined_df)} samples across all sweeps.")
+    print("="*70 + "\n")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Schlieren ML Automated Sweep Data Collector")
     parser.add_argument("--start", type=float, default=48.60, help="Start X position (mm)")
     parser.add_argument("--end", type=float, default=50.20, help="End X position (mm)")
     parser.add_argument("--step", type=float, default=0.03, help="Step size (mm)")
+    parser.add_argument("--condition", type=str, default="normal_light", 
+                        help="Condition tag: e.g. normal_light, dim_light, bright_light, room_lights_off")
+    parser.add_argument("--sound", choices=["on", "off"], default="on", 
+                        help="Transducer state: 'on' (soundwaves active) or 'off' (pure heat negatives)")
     args = parser.parse_args()
+    
+    sound_bool = (args.sound == "on")
     
     print(f"Connecting to Duet 2 at {DUET_IP}...")
     duet = DuetController(DUET_IP)
@@ -197,12 +232,17 @@ if __name__ == "__main__":
     print("Opening Camera...")
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
-        print("Error: Could not open camera.")
+        print(f"Error: Could not open camera {CAMERA_INDEX}.")
         sys.exit(1)
         
     try:
         mirror_geom, chamber_bbox = detect_mirror_and_chamber(cap)
-        run_automated_sweep(duet, cap, chamber_bbox, mirror_geom, args.start, args.end, args.step)
+        run_automated_sweep(
+            duet, cap, chamber_bbox, mirror_geom, 
+            args.start, args.end, args.step, 
+            condition_tag=args.condition, 
+            sound_on=sound_bool
+        )
     finally:
         cap.release()
-        print("Camera released.")
+        print("Camera released cleanly.")
