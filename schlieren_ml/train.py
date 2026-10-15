@@ -29,10 +29,21 @@ def train_model(epochs=35, batch_size=16, lr=1e-3, val_split=0.2):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on device: {device}")
     
+    # --- HANDLE DATASET SKEW / CLASS IMBALANCE ---
+    # 1. Compute inverse-frequency class weights for CrossEntropyLoss
+    regime_counts = [0, 0, 0]
+    for _, _, r, _ in train_loader.dataset:
+        regime_counts[r.item()] += 1
+    total_samples = len(train_loader.dataset)
+    class_weights = [total_samples / (3.0 * max(1, c)) for c in regime_counts]
+    class_weights_t = torch.tensor(class_weights, dtype=torch.float32).to(device)
+    
+    print(f"Dataset Regime Counts (Train): Under={regime_counts[0]}, Optimal={regime_counts[1]}, Over={regime_counts[2]}")
+    print(f"Applied Class Loss Multipliers: Under={class_weights[0]:.2f}x, Optimal={class_weights[1]:.2f}x, Over={class_weights[2]:.2f}x")
+    
     model = SpatioTemporalWaveNet().to(device)
     
-    mse_criterion = nn.MSELoss()
-    ce_criterion = nn.CrossEntropyLoss()
+    ce_criterion = nn.CrossEntropyLoss(weight=class_weights_t)
     
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
@@ -61,9 +72,13 @@ def train_model(epochs=35, batch_size=16, lr=1e-3, val_split=0.2):
             optimizer.zero_grad()
             pred_q, pred_r = model(batch_x)
             
-            loss_q = mse_criterion(pred_q, target_q)
+            # Peak-Weighted MSE: Heavily penalizes errors on rare 'Optimal' wave samples
+            # (Errors on Q=1.0 count 4x more than errors on Q=0.0)
+            q_weights = 1.0 + 3.0 * target_q
+            loss_q = torch.mean(q_weights * (pred_q - target_q) ** 2)
+            
             loss_r = ce_criterion(pred_r, target_r)
-            total_loss = loss_q + 0.5 * loss_r
+            total_loss = loss_q + 0.6 * loss_r
             
             total_loss.backward()
             optimizer.step()

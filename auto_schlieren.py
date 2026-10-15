@@ -5,7 +5,7 @@ from collections import deque
 from duet_controller import DuetController
 
 # --- CONFIGURATION ---
-DUET_IP = "192.168.137.85"  # Your Duet 2 IP
+DUET_IP = "192.168.137.243"  # Your Duet 2 IP
 CAMERA_INDEX = 1           
 
 PRESET_X_POSITION = 49.30   # Base center position

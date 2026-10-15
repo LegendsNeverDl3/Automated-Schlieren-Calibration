@@ -85,7 +85,7 @@ class DuetController:
 # --- Example Usage ---
 if __name__ == "__main__":
     # Replace with your Duet's actual IP address!
-    DUET_IP = "192.168.137.85" 
+    DUET_IP = "192.168.137.243" 
     
     duet = DuetController(DUET_IP)
     
