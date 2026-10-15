@@ -16,7 +16,7 @@ CURVES_PLOT_PATH = os.path.join(MODELS_DIR, "training_curves.png")
 
 os.makedirs(MODELS_DIR, exist_ok=True)
 
-def train_model(epochs=35, batch_size=16, lr=1e-3, val_split=0.2):
+def train_model(epochs=50, batch_size=16, lr=1e-3, val_split=0.2):
     if not os.path.exists(MANIFEST_PATH):
         print(f"[Error] Dataset manifest not found at: {MANIFEST_PATH}")
         print("Run 'python data_collector.py' or 'python ingest_archival_videos.py' first to collect data!")
@@ -43,6 +43,7 @@ def train_model(epochs=35, batch_size=16, lr=1e-3, val_split=0.2):
     
     model = SpatioTemporalWaveNet().to(device)
     
+    mse_criterion = nn.MSELoss()
     ce_criterion = nn.CrossEntropyLoss(weight=class_weights_t)
     
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
@@ -78,7 +79,7 @@ def train_model(epochs=35, batch_size=16, lr=1e-3, val_split=0.2):
             loss_q = torch.mean(q_weights * (pred_q - target_q) ** 2)
             
             loss_r = ce_criterion(pred_r, target_r)
-            total_loss = loss_q + 0.6 * loss_r
+            total_loss = loss_q + 1.0 * loss_r
             
             total_loss.backward()
             optimizer.step()
