@@ -12,7 +12,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from duet_controller import DuetController
 
 # --- CONFIGURATION ---
-DUET_IP = "192.168.137.243"
+DUET_IP = "192.168.137.116"
 CAMERA_INDEX = 1
 
 DATASET_DIR = os.path.join(os.path.dirname(__file__), "dataset")
