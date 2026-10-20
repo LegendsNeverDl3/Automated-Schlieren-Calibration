@@ -106,8 +106,8 @@ def run_live_evaluation():
             sx[:, max(0, mid_rel - 18) : min(sx.shape[1], mid_rel + 18)] = 0
             classic_score = float(np.var(sx))
             
-            # Prepare tensor for ML inference
-            m_res = cv2.resize(mean_map, (128, 128)).astype(np.float32) / 255.0
+            # Prepare tensor for ML inference with CLAHE contrast normalization
+            m_res = cv2.resize(echamber, (128, 128)).astype(np.float32) / 255.0
             v_res = cv2.resize(var_norm, (128, 128)).astype(np.float32) / 255.0
             tensor_x = torch.from_numpy(np.stack([m_res, v_res], axis=0)).unsqueeze(0)
             

@@ -44,7 +44,11 @@ class SchlierenDataset(Dataset):
             mean_img = cv2.resize(mean_img, self.img_size, interpolation=cv2.INTER_AREA)
             var_img = cv2.resize(var_img, self.img_size, interpolation=cv2.INTER_AREA)
             
-        mean_f = mean_img.astype(np.float32) / 255.0
+        # Strip out global DC background illumination via CLAHE local contrast equalization
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        mean_clahe = clahe.apply(mean_img)
+        
+        mean_f = mean_clahe.astype(np.float32) / 255.0
         var_f = var_img.astype(np.float32) / 255.0
         
         # Training Augmentations
@@ -56,9 +60,10 @@ class SchlierenDataset(Dataset):
             mean_f = cv2.warpAffine(mean_f, M, self.img_size, borderMode=cv2.BORDER_REFLECT)
             var_f = cv2.warpAffine(var_f, M, self.img_size, borderMode=cv2.BORDER_REFLECT)
             
-            # 2. Illumination scaling (simulate beam splitter light fluctuations)
-            scale = np.random.uniform(0.88, 1.12)
-            mean_f = np.clip(mean_f * scale, 0.0, 1.0)
+            # 2. Aggressive illumination invariance (forces AI to ignore overall brightness)
+            scale = np.random.uniform(0.65, 1.35)
+            bias = np.random.uniform(-0.15, 0.15)
+            mean_f = np.clip(mean_f * scale + bias, 0.0, 1.0)
             
             # 3. Additive Gaussian noise
             noise = np.random.normal(0, 0.015, self.img_size).astype(np.float32)

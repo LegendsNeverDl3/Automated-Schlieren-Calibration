@@ -103,8 +103,10 @@ def capture_burst_and_evaluate(cap, chamber_bbox, model, num_frames=10):
     var_map = np.var(stack, axis=0)
     var_norm = cv2.normalize(var_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     
-    # 4. Format into (1, 2, 128, 128) tensor for model
-    m_res = cv2.resize(mean_map, (128, 128)).astype(np.float32) / 255.0
+    # 4. Format into (1, 2, 128, 128) tensor for model with CLAHE contrast normalization
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    mean_clahe = clahe.apply(mean_map)
+    m_res = cv2.resize(mean_clahe, (128, 128)).astype(np.float32) / 255.0
     v_res = cv2.resize(var_norm, (128, 128)).astype(np.float32) / 255.0
     tensor_x = torch.from_numpy(np.stack([m_res, v_res], axis=0)).unsqueeze(0)
     
