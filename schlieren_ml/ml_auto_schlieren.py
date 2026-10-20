@@ -18,19 +18,35 @@ from duet_controller import DuetController
 from model import SpatioTemporalWaveNet
 
 # --- HARDWARE & OPTICS CONFIGURATION ---
-DUET_IP = "192.168.137.116"
+DUET_IP = "192.168.137.243"
 CAMERA_INDEX = 1
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "best_model.pth")
 
 # Search parameters
-COARSE_START_X = 48.600
-COARSE_END_X = 50.200
-COARSE_STEP = 0.040      # Stage 1: Coarse corridor sweep
-FINE_STEP = 0.010        # Stage 2: Sub-mm micro sweep
-CORRIDOR_THRESHOLD = 0.60 # Quality score threshold defining the sweet spot corridor
+START_X = 48.600
+MAX_X = 50.400
+STEP_SIZE = 0.020        # 20 micron steps for smooth peak profiling
+CORRIDOR_THRESHOLD = 0.55 # Minimum score to consider entering sweet spot
+MIN_DROPS_TO_CONFIRM = 3  # Number of consecutive decreasing readings to confirm peak is passed
+DROP_TOLERANCE = 0.15     # Total drop from peak required to confirm downward slope
 
 REGIME_NAMES = ["Under-Cutoff", "Optimal Cutoff", "Over-Cutoff"]
 REGIME_COLORS = [(0, 165, 255), (0, 255, 0), (0, 0, 255)]  # Orange, Green, Red
+
+def move_x_unidirectional(duet, target_x, overshoot_distance=0.250):
+    """
+    Drives to target_x always arriving in the forward (+X) direction.
+    If moving left (negative direction), retracts past target_x by overshoot_distance,
+    then approaches forward (+X). This completely eliminates mechanical leadscrew backlash.
+    """
+    retract_x = target_x - overshoot_distance
+    duet.move_x_absolute(retract_x)
+    duet.wait_for_move()
+    time.sleep(0.3)
+    
+    duet.move_x_absolute(target_x)
+    duet.wait_for_move()
+    time.sleep(0.35)
 
 def detect_mirror_and_chamber(cap):
     """Detects mirror center and isolates the acoustic chamber ROI with boundary safety."""
@@ -168,154 +184,178 @@ def run_ml_auto_alignment():
         cx, cy, rad = mirror_geom
         
         # =====================================================================
-        # STAGE 1: ML-GUIDED COARSE SEARCH (Corridor Acquisition)
+        # FORWARD SWEEP WITH PEAK-AND-PAST NEGATIVE-SLOPE DETECTION
         # =====================================================================
         print("\n" + "-"*65)
-        print("STAGE 1: ML Global Corridor Acquisition (Coarse Step: 0.040 mm)")
-        print(f"Sweeping X from {COARSE_START_X:.3f} mm to {COARSE_END_X:.3f} mm...")
+        print(f"FORWARD SWEEP: Stepping X from {START_X:.3f} mm to {MAX_X:.3f} mm (Step: {STEP_SIZE:.3f} mm)")
+        print("Climbing toward peak, then stepping PAST to confirm negative slope...")
         print("-"*65)
         
-        duet.move_x_absolute(COARSE_START_X)
+        duet.move_x_absolute(START_X)
         duet.wait_for_move()
         time.sleep(0.5)
         
-        curr_x = COARSE_START_X
-        corridor_xs = []
-        corridor_qs = []
-        in_corridor = False
+        curr_x = START_X
+        all_xs = []
+        all_qs = []
         
-        while curr_x <= COARSE_END_X + 1e-4:
+        peak_q = 0.0
+        peak_x = START_X
+        prev_q = 0.0
+        consecutive_drops = 0
+        peak_confirmed = False
+        
+        while curr_x <= MAX_X + 1e-4:
             duet.move_x_absolute(curr_x)
             duet.wait_for_move()
-            time.sleep(0.20)  # Settle vibrations
+            time.sleep(0.20)  # Settle mechanical vibrations
             
             q, reg_idx, conf, mean_map, var_map = capture_burst_and_evaluate(cap, chamber_bbox, model)
+            all_xs.append(curr_x)
+            all_qs.append(q)
             
             # Render HUD
             ret, full_frame = cap.read()
             if not ret: full_frame = np.zeros((480, 640, 3), dtype=np.uint8)
             display = full_frame.copy()
-            draw_hud(display, curr_x, q, reg_idx, conf, "Stage 1: Coarse Corridor Search", cx, cy, rad, chamber_bbox)
+            status_text = "Hunting for Peak..." if consecutive_drops == 0 else f"Confirming Negative Slope ({consecutive_drops}/{MIN_DROPS_TO_CONFIRM})"
+            draw_hud(display, curr_x, q, reg_idx, conf, f"Forward Sweep ({status_text})", cx, cy, rad, chamber_bbox)
             cv2.imshow(window_name, display)
             cv2.waitKey(1)
             
-            print(f"  X={curr_x:.3f} mm | ML Quality: {q:.3f} | Regime: {REGIME_NAMES[reg_idx]} ({conf:.1f}%)")
+            print(f"  X={curr_x:.3f} mm | Quality: {q:.4f} | Regime: {REGIME_NAMES[reg_idx]} ({conf:.1f}%) | Peak: {peak_q:.4f} (at {peak_x:.3f} mm)")
             
-            # Detect entrance into sweet spot corridor
-            if q >= CORRIDOR_THRESHOLD and reg_idx == 1:
-                if not in_corridor:
-                    print(f"  >>> [CORRIDOR DETECTED] Entered sweet spot at X = {curr_x:.3f} mm! <<<")
-                    in_corridor = True
-                corridor_xs.append(curr_x)
-                corridor_qs.append(q)
-            elif in_corridor and (q < CORRIDOR_THRESHOLD or reg_idx == 2):
-                print(f"  >>> [CORRIDOR EXITED] Sweet spot ended at X = {curr_x:.3f} mm. <<<")
-                break
+            # Track peak and monitor negative slope
+            if q > peak_q:
+                peak_q = q
+                peak_x = curr_x
+                consecutive_drops = 0
+            elif peak_q >= CORRIDOR_THRESHOLD:
+                # We have reached a strong wave signal and are now past the peak candidate
+                if q < prev_q:
+                    consecutive_drops += 1
+                else:
+                    consecutive_drops = max(0, consecutive_drops - 1)
+                    
+                drop_from_peak = peak_q - q
+                print(f"    -> [Post-Peak Monitor] Drops: {consecutive_drops}/{MIN_DROPS_TO_CONFIRM} | Drop from peak: -{drop_from_peak:.3f}")
                 
-            curr_x += COARSE_STEP
+                # Confirm negative slope: multiple consecutive drops and dropped by at least DROP_TOLERANCE
+                if consecutive_drops >= MIN_DROPS_TO_CONFIRM and drop_from_peak >= DROP_TOLERANCE:
+                    print(f"\n>>> [NEGATIVE SLOPE CONFIRMED] Passed the sweet spot! <<<")
+                    print(f"    Peak recorded at:  X = {peak_x:.3f} mm (Score: {peak_q:.4f})")
+                    print(f"    Current reading:   X = {curr_x:.3f} mm (Score: {q:.4f})")
+                    print(f"    Observed {consecutive_drops} consecutive drops over {(curr_x - peak_x):.3f} mm past peak.")
+                    peak_confirmed = True
+                    break
+                    
+            prev_q = q
+            curr_x += STEP_SIZE
             
-        if not corridor_xs:
-            print("\n[Warning] Did not detect strong corridor during forward sweep.")
-            print("Fallback: Using highest point observed.")
-            corridor_start = 49.300
-            corridor_end = 49.500
-        else:
-            corridor_start = min(corridor_xs) - 0.020
-            corridor_end = max(corridor_xs) + 0.020
+        if not peak_confirmed:
+            print(f"\n[Notice] Reached sweep boundary. Highest score recorded was at X = {peak_x:.3f} mm.")
             
-        print(f"\n[Stage 1 Complete] Bounded Optimal Corridor: [{corridor_start:.3f} mm -> {corridor_end:.3f} mm]")
-        
         # =====================================================================
-        # STAGE 2: SUB-MILLIMETER PARABOLIC VERTEX LOCK
+        # PARABOLIC VERTEX REFINEMENT
         # =====================================================================
-        print("\n" + "-"*65)
-        print("STAGE 2: Sub-mm Parabolic Vertex Lock (Micro Step: 0.010 mm)")
-        print(f"Micro-sweeping through corridor [{corridor_start:.3f} mm -> {corridor_end:.3f} mm]...")
-        print("-"*65)
+        xs_arr = np.array(all_xs)
+        qs_arr = np.array(all_qs)
         
-        duet.move_x_absolute(corridor_start)
+        # Window of points around the crest (climb, peak, descent)
+        mask = (xs_arr >= peak_x - 0.070) & (xs_arr <= peak_x + 0.070)
+        fit_xs = xs_arr[mask]
+        fit_qs = qs_arr[mask]
+        
+        optimal_x = peak_x
+        if len(fit_xs) >= 4:
+            try:
+                poly = np.polyfit(fit_xs, fit_qs, 2)
+                a, b, c = poly
+                if a < 0:  # Inverted parabola with a true maximum peak
+                    vertex_x = -b / (2.0 * a)
+                    # Safety check: vertex must be within microns of the discrete peak
+                    if abs(vertex_x - peak_x) <= 0.030:
+                        optimal_x = vertex_x
+                        print(f"\n--- PARABOLIC REFINEMENT ---")
+                        print(f"Fit: Q(x) = {a:.2f}x^2 + {b:.2f}x + {c:.2f}")
+                        print(f"Discrete Peak: {peak_x:.3f} mm -> Mathematical Vertex: {optimal_x:.4f} mm")
+            except Exception as fit_err:
+                print(f"[Notice] Parabolic fit fallback to discrete peak ({fit_err})")
+                
+        # =====================================================================
+        # STAGE 2: ANTI-BACKLASH RETURN & CLOSED-LOOP MICRO-POLISH
+        # =====================================================================
+        print("\n" + "="*70)
+        print("STAGE 2: Anti-Backlash Return & Closed-Loop Optical Peak Polish")
+        print("="*70)
+        
+        # Candidate positions around the peak to eliminate any remaining overshoot / backlash
+        # Prioritize left-shifted points (-0.06 to +0.02 mm) to completely prevent overshooting
+        polish_offsets = [-0.060, -0.040, -0.020, 0.000, +0.020]
+        test_positions = [optimal_x + off for off in polish_offsets]
+        
+        print(f"[Anti-Backlash] Retracting left to start unidirectional forward polish...")
+        # Move well past the leftmost candidate to load lead screw in forward (+X) direction
+        duet.move_x_absolute(min(test_positions) - 0.250)
         duet.wait_for_move()
-        time.sleep(0.5)
+        time.sleep(0.4)
         
-        fine_xs = []
-        fine_qs = []
-        curr_x = corridor_start
+        best_live_q = -1.0
+        best_live_x = optimal_x
+        best_live_reg = 1
+        best_live_conf = 0.0
         
-        while curr_x <= corridor_end + 1e-4:
-            duet.move_x_absolute(curr_x)
+        print("\n[Micro-Polish] Stepping forward through peak candidates with 0 microns backlash:")
+        for tx in sorted(test_positions):
+            # Always step forward into candidate
+            duet.move_x_absolute(tx)
             duet.wait_for_move()
-            time.sleep(0.20)
+            time.sleep(0.25)
             
-            q, reg_idx, conf, mean_map, var_map = capture_burst_and_evaluate(cap, chamber_bbox, model)
-            fine_xs.append(curr_x)
-            fine_qs.append(q)
+            lq, lreg, lconf, lmean, lvar = capture_burst_and_evaluate(cap, chamber_bbox, model, num_frames=10)
+            print(f"  Candidate X={tx:.3f} mm -> Live ML Quality: {lq:.4f} | Regime: {REGIME_NAMES[lreg]} ({lconf:.1f}%)")
             
+            # Update HUD
             ret, full_frame = cap.read()
-            if not ret: full_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-            display = full_frame.copy()
-            draw_hud(display, curr_x, q, reg_idx, conf, "Stage 2: Micro Parabolic Sweep", cx, cy, rad, chamber_bbox)
+            display = full_frame.copy() if ret else np.zeros((480, 640, 3), dtype=np.uint8)
+            draw_hud(display, tx, lq, lreg, lconf, "Stage 2: Closed-Loop Polish", cx, cy, rad, chamber_bbox)
             cv2.imshow(window_name, display)
             cv2.waitKey(1)
             
-            print(f"  [Micro] X={curr_x:.3f} mm -> ML Score: {q:.4f}")
-            curr_x += FINE_STEP
-            
-        # Mathematical Parabolic Fitting: Q(x) = ax^2 + bx + c
-        xs = np.array(fine_xs)
-        qs = np.array(fine_qs)
-        
-        print("\n--- CALCULATING SUB-MILLIMETER PARABOLIC VERTEX ---")
-        try:
-            poly = np.polyfit(xs, qs, 2)
-            a, b, c = poly
-            
-            # Vertex of parabola: x* = -b / (2a)
-            if a < 0:  # Inverted parabola (has a true maximum peak)
-                optimal_x = -b / (2.0 * a)
-                # Clamp within corridor bounds for physical safety
-                optimal_x = max(min(optimal_x, corridor_end), corridor_start)
-                print(f"Parabolic Fit: Q(x) = {a:.2f}x^2 + {b:.2f}x + {c:.2f}")
-                print(f"Mathematical Peak Vertex: X* = {optimal_x:.4f} mm")
-            else:
-                # Upward parabola (fallback to discrete maximum)
-                best_idx = np.argmax(qs)
-                optimal_x = xs[best_idx]
-                print(f"Parabola did not invert; fallback to discrete peak at X* = {optimal_x:.3f} mm")
-        except Exception as e:
-            best_idx = np.argmax(qs)
-            optimal_x = xs[best_idx]
-            print(f"Fitting error ({e}); fallback to discrete peak at X* = {optimal_x:.3f} mm")
-            
-        # =====================================================================
-        # FINAL LOCK: MOVE TO SUB-MM OPTICAL VERTEX
-        # =====================================================================
-        print(f"\n[Final Action] Driving knife edge to sub-millimeter optical peak: {optimal_x:.4f} mm...")
-        duet.move_x_absolute(optimal_x)
-        duet.wait_for_move()
-        time.sleep(0.5)
+            if lq > best_live_q:
+                best_live_q = lq
+                best_live_x = tx
+                best_live_reg = lreg
+                best_live_conf = lconf
+                
+        # Drive forward to the confirmed best live position
+        print(f"\n[Final Action] Locking knife-edge to best live optical position: X = {best_live_x:.3f} mm...")
+        move_x_unidirectional(duet, best_live_x, overshoot_distance=0.200)
         
         # Grab final locked verification frame
         final_q, final_reg, final_conf, final_mean, _ = capture_burst_and_evaluate(cap, chamber_bbox, model, num_frames=12)
         
+        print("\n" + "="*70)
+        print("--- ALIGNMENT COMPLETE! SCHLIEREN SYSTEM IS OPTIMIZED ---")
+        print(f"  Initial Estimated Peak:   {peak_x:.3f} mm")
+        print(f"  Final Locked Position:    {best_live_x:.3f} mm")
+        print(f"  Correction Applied:       {(best_live_x - peak_x):+.3f} mm")
+        print(f"  Final ML Wave Quality:    {final_q:.4f} / 1.000")
+        print(f"  Predicted Cutoff Regime:  {REGIME_NAMES[final_reg]} ({final_conf:.1f}% confidence)")
+        print("="*70)
+        
         ret, full_frame = cap.read()
         display = full_frame.copy() if ret else np.zeros((480, 640, 3), dtype=np.uint8)
-        draw_hud(display, optimal_x, final_q, final_reg, final_conf, "ALIGNMENT COMPLETE (LOCKED)", cx, cy, rad, chamber_bbox)
+        draw_hud(display, best_live_x, final_q, final_reg, final_conf, "ALIGNMENT COMPLETE (LOCKED)", cx, cy, rad, chamber_bbox)
         
         # Green Locked Badge
-        cv2.rectangle(display, (display.shape[1] - 320, 10), (display.shape[1] - 10, 70), (0, 180, 0), -1)
-        cv2.putText(display, "SYSTEM OPTIMIZED", (display.shape[1] - 305, 38), 
+        cv2.rectangle(display, (display.shape[1] - 340, 10), (display.shape[1] - 10, 75), (0, 180, 0), -1)
+        cv2.putText(display, "SYSTEM OPTIMIZED", (display.shape[1] - 325, 38), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-        cv2.putText(display, f"Peak Locked at {optimal_x:.3f} mm", (display.shape[1] - 305, 58), 
+        cv2.putText(display, f"Peak: {final_q:.3f} at {best_live_x:.3f} mm", (display.shape[1] - 325, 60), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 255, 220), 1)
         
         cv2.imshow(window_name, display)
-        
-        print("\n" + "="*70)
-        print("--- ALIGNMENT COMPLETE! SCHLIEREN SYSTEM IS OPTIMIZED ---")
-        print(f"  Optimal Motor Position:  {optimal_x:.4f} mm")
-        print(f"  Final ML Wave Quality:   {final_q:.4f} / 1.000")
-        print(f"  Predicted Cutoff Regime: {REGIME_NAMES[final_reg]} ({final_conf:.1f}% confidence)")
-        print("="*70)
         print("Press any key in the camera window to close and exit.")
         cv2.waitKey(0)
         
