@@ -19,7 +19,7 @@ from duet_controller import DuetController
 from model import SpatioTemporalWaveNet
 
 # --- HARDWARE & OPTICS CONFIGURATION ---
-DUET_IP = "192.168.137.129"
+DUET_IP = "192.168.137.62"
 CAMERA_INDEX = 1
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
 
