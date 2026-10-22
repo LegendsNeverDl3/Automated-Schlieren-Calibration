@@ -2,6 +2,7 @@ import os
 import sys
 import cv2
 import time
+import argparse
 import torch
 import numpy as np
 from datetime import datetime
@@ -18,17 +19,18 @@ from duet_controller import DuetController
 from model import SpatioTemporalWaveNet
 
 # --- HARDWARE & OPTICS CONFIGURATION ---
-DUET_IP = "192.168.137.243"
+DUET_IP = "192.168.137.129"
 CAMERA_INDEX = 1
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "best_model.pth")
+MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
 
 # Search parameters
 START_X = 48.600
 MAX_X = 50.400
-STEP_SIZE = 0.020        # 20 micron steps for smooth peak profiling
-CORRIDOR_THRESHOLD = 0.55 # Minimum score to consider entering sweet spot
-MIN_DROPS_TO_CONFIRM = 3  # Number of consecutive decreasing readings to confirm peak is passed
-DROP_TOLERANCE = 0.15     # Total drop from peak required to confirm downward slope
+STEP_SIZE = 0.020          # 20 micron steps for smooth peak profiling
+CORRIDOR_THRESHOLD = 0.50   # Minimum score to consider entering sweet spot
+MIN_DROPS_TO_CONFIRM = 3    # Number of consecutive decreasing readings to confirm peak is passed
+DROP_TOLERANCE = 0.12       # Total drop from peak required to confirm downward slope
+MIN_QUALITY_TO_LOCK = 0.48  # Strict safety threshold: reject alignment if peak is below this score
 
 REGIME_NAMES = ["Under-Cutoff", "Optimal Cutoff", "Over-Cutoff"]
 REGIME_COLORS = [(0, 165, 255), (0, 255, 0), (0, 0, 255)]  # Orange, Green, Red
@@ -77,7 +79,7 @@ def detect_mirror_and_chamber(cap):
     print(f"[Optics] Chamber ROI: X=[{x1}, {x2}], Y=[{y1}, {y2}] ({x2-x1}x{y2-y1} px)")
     return (cx, cy, rad), (x1, y1, x2, y2)
 
-def capture_burst_and_evaluate(cap, chamber_bbox, model, num_frames=10):
+def capture_burst_and_evaluate(cap, chamber_bbox, model, num_frames=10, use_clahe=False):
     """Flushes driver buffers, grabs burst frames, and runs neural network inference."""
     x1, y1, x2, y2 = chamber_bbox
     frames = []
@@ -103,10 +105,16 @@ def capture_burst_and_evaluate(cap, chamber_bbox, model, num_frames=10):
     var_map = np.var(stack, axis=0)
     var_norm = cv2.normalize(var_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     
-    # 4. Format into (1, 2, 128, 128) tensor for model with CLAHE contrast normalization
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    mean_clahe = clahe.apply(mean_map)
-    m_res = cv2.resize(mean_clahe, (128, 128)).astype(np.float32) / 255.0
+    # 4. Format into (1, 2, 128, 128) tensor for model
+    if use_clahe:
+        # Version 2: Apply CLAHE local contrast normalization
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        mean_in = clahe.apply(mean_map)
+    else:
+        # Version 1: Raw linear mean map
+        mean_in = mean_map
+        
+    m_res = cv2.resize(mean_in, (128, 128)).astype(np.float32) / 255.0
     v_res = cv2.resize(var_norm, (128, 128)).astype(np.float32) / 255.0
     tensor_x = torch.from_numpy(np.stack([m_res, v_res], axis=0)).unsqueeze(0)
     
@@ -151,33 +159,50 @@ def draw_hud(display, curr_x, quality, regime_idx, confidence, stage_text, cx, c
     cv2.rectangle(display, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), (0, 255, 0), -1)
     cv2.rectangle(display, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (255, 255, 255), 1)
 
-def run_ml_auto_alignment():
+def run_ml_auto_alignment(model_version="v1", duet_ip=DUET_IP, camera_index=CAMERA_INDEX):
     print("\n" + "="*70)
     print("--- ML-GUIDED CLOSED-LOOP SCHLIEREN AUTO-ALIGNMENT ---")
     print("="*70)
     
-    # 1. Load Trained Neural Network
-    if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(f"Model checkpoint not found at: {MODEL_PATH}. Run train.py first!")
+    # Configure model and preprocessing based on version
+    use_v2 = (model_version.lower() in ["v2", "2"])
+    if use_v2:
+        model_path = os.path.join(MODELS_DIR, "best_model_v2.pth")
+        use_clahe = True
+        v_label = "Version 2 (CLAHE Contrast Normalized)"
+    else:
+        model_path = os.path.join(MODELS_DIR, "best_model_v1.pth")
+        if not os.path.exists(model_path):
+            model_path = os.path.join(MODELS_DIR, "best_model.pth")
+        use_clahe = False
+        v_label = "Version 1 (Raw Mean + Variance Baseline, Recommended)"
         
-    print(f"[AI] Loading trained weights from: {MODEL_PATH}")
-    checkpoint = torch.load(MODEL_PATH, map_location="cpu")
+    print(f"[AI] Active Configuration: {v_label}")
+    print(f"[AI] Model Path: {model_path}")
+    print(f"[AI] Preprocessing: {'CLAHE enabled' if use_clahe else 'Raw inputs (no CLAHE)'}")
+    print(f"[Safety] Minimum lock threshold: Q >= {MIN_QUALITY_TO_LOCK}")
+    
+    # 1. Load Trained Neural Network
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model checkpoint not found at: {model_path}.")
+        
+    checkpoint = torch.load(model_path, map_location="cpu")
     model = SpatioTemporalWaveNet()
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
-    print("[AI] SpatioTemporalWaveNet ready on CPU.")
+    print("[AI] SpatioTemporalWaveNet loaded ready on CPU.")
     
     # 2. Connect Duet 2
-    print(f"[Duet] Connecting to Duet 2 at {DUET_IP}...")
-    duet = DuetController(DUET_IP)
+    print(f"[Duet] Connecting to Duet 2 at {duet_ip}...")
+    duet = DuetController(duet_ip)
     
     # 3. Open Camera
     print("Opening Camera...")
-    cap = cv2.VideoCapture(CAMERA_INDEX)
+    cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
-        raise RuntimeError(f"Could not open camera index {CAMERA_INDEX}")
+        raise RuntimeError(f"Could not open camera index {camera_index}")
         
-    window_name = "ML Auto-Schlieren Closed-Loop Alignment"
+    window_name = f"ML Auto-Schlieren Closed-Loop Alignment [{model_version.upper()}]"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, 1200, 850)
     
@@ -212,7 +237,9 @@ def run_ml_auto_alignment():
             duet.wait_for_move()
             time.sleep(0.20)  # Settle mechanical vibrations
             
-            q, reg_idx, conf, mean_map, var_map = capture_burst_and_evaluate(cap, chamber_bbox, model)
+            q, reg_idx, conf, mean_map, var_map = capture_burst_and_evaluate(
+                cap, chamber_bbox, model, num_frames=10, use_clahe=use_clahe
+            )
             all_xs.append(curr_x)
             all_qs.append(q)
             
@@ -221,7 +248,7 @@ def run_ml_auto_alignment():
             if not ret: full_frame = np.zeros((480, 640, 3), dtype=np.uint8)
             display = full_frame.copy()
             status_text = "Hunting for Peak..." if consecutive_drops == 0 else f"Confirming Negative Slope ({consecutive_drops}/{MIN_DROPS_TO_CONFIRM})"
-            draw_hud(display, curr_x, q, reg_idx, conf, f"Forward Sweep ({status_text})", cx, cy, rad, chamber_bbox)
+            draw_hud(display, curr_x, q, reg_idx, conf, f"Forward Sweep [{model_version.upper()}] ({status_text})", cx, cy, rad, chamber_bbox)
             cv2.imshow(window_name, display)
             cv2.waitKey(1)
             
@@ -256,6 +283,30 @@ def run_ml_auto_alignment():
             
         if not peak_confirmed:
             print(f"\n[Notice] Reached sweep boundary. Highest score recorded was at X = {peak_x:.3f} mm.")
+            
+        # =====================================================================
+        # SAFETY GATE: Reject lock if peak quality is below threshold
+        # =====================================================================
+        if peak_q < MIN_QUALITY_TO_LOCK:
+            print("\n" + "!"*70)
+            print(f"[SAFETY ABORT] Peak quality ({peak_q:.4f}) is BELOW safety threshold ({MIN_QUALITY_TO_LOCK})!")
+            print("No distinct acoustic standing wave was identified (mirror dark or acoustics off).")
+            print(f"Safely retracting knife-edge back to START_X ({START_X:.3f} mm) to prevent false lock.")
+            print("!"*70 + "\n")
+            move_x_unidirectional(duet, START_X)
+            
+            ret, full_frame = cap.read()
+            display = full_frame.copy() if ret else np.zeros((480, 640, 3), dtype=np.uint8)
+            draw_hud(display, START_X, peak_q, 0, 0.0, "ABORTED: LOW CONFIDENCE", cx, cy, rad, chamber_bbox)
+            cv2.rectangle(display, (display.shape[1] - 370, 10), (display.shape[1] - 10, 75), (0, 0, 200), -1)
+            cv2.putText(display, "ALIGNMENT ABORTED", (display.shape[1] - 355, 38), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+            cv2.putText(display, f"Peak Q {peak_q:.2f} < {MIN_QUALITY_TO_LOCK}", (display.shape[1] - 355, 60), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 255), 1)
+            cv2.imshow(window_name, display)
+            print("Press any key in the camera window to exit.")
+            cv2.waitKey(0)
+            return
             
         # =====================================================================
         # PARABOLIC VERTEX REFINEMENT
@@ -314,13 +365,15 @@ def run_ml_auto_alignment():
             duet.wait_for_move()
             time.sleep(0.25)
             
-            lq, lreg, lconf, lmean, lvar = capture_burst_and_evaluate(cap, chamber_bbox, model, num_frames=10)
+            lq, lreg, lconf, lmean, lvar = capture_burst_and_evaluate(
+                cap, chamber_bbox, model, num_frames=10, use_clahe=use_clahe
+            )
             print(f"  Candidate X={tx:.3f} mm -> Live ML Quality: {lq:.4f} | Regime: {REGIME_NAMES[lreg]} ({lconf:.1f}%)")
             
             # Update HUD
             ret, full_frame = cap.read()
             display = full_frame.copy() if ret else np.zeros((480, 640, 3), dtype=np.uint8)
-            draw_hud(display, tx, lq, lreg, lconf, "Stage 2: Closed-Loop Polish", cx, cy, rad, chamber_bbox)
+            draw_hud(display, tx, lq, lreg, lconf, f"Stage 2: Polish [{model_version.upper()}]", cx, cy, rad, chamber_bbox)
             cv2.imshow(window_name, display)
             cv2.waitKey(1)
             
@@ -335,7 +388,9 @@ def run_ml_auto_alignment():
         move_x_unidirectional(duet, best_live_x, overshoot_distance=0.200)
         
         # Grab final locked verification frame
-        final_q, final_reg, final_conf, final_mean, _ = capture_burst_and_evaluate(cap, chamber_bbox, model, num_frames=12)
+        final_q, final_reg, final_conf, final_mean, _ = capture_burst_and_evaluate(
+            cap, chamber_bbox, model, num_frames=12, use_clahe=use_clahe
+        )
         
         print("\n" + "="*70)
         print("--- ALIGNMENT COMPLETE! SCHLIEREN SYSTEM IS OPTIMIZED ---")
@@ -348,7 +403,7 @@ def run_ml_auto_alignment():
         
         ret, full_frame = cap.read()
         display = full_frame.copy() if ret else np.zeros((480, 640, 3), dtype=np.uint8)
-        draw_hud(display, best_live_x, final_q, final_reg, final_conf, "ALIGNMENT COMPLETE (LOCKED)", cx, cy, rad, chamber_bbox)
+        draw_hud(display, best_live_x, final_q, final_reg, final_conf, f"LOCKED [{model_version.upper()}]", cx, cy, rad, chamber_bbox)
         
         # Green Locked Badge
         cv2.rectangle(display, (display.shape[1] - 340, 10), (display.shape[1] - 10, 75), (0, 180, 0), -1)
@@ -367,4 +422,12 @@ def run_ml_auto_alignment():
         print("Camera released cleanly.")
 
 if __name__ == "__main__":
-    run_ml_auto_alignment()
+    parser = argparse.ArgumentParser(description="ML-Guided Closed-Loop Schlieren Auto-Alignment")
+    parser.add_argument("--model-version", "--version", "-v", choices=["v1", "1", "v2", "2"], default="v1",
+                        help="Model version to use: 'v1' / '1' (Raw baseline, default) or 'v2' / '2' (CLAHE normalized)")
+    parser.add_argument("--ip", type=str, default=DUET_IP, help=f"Duet 2 IP address (default: {DUET_IP})")
+    parser.add_argument("--cam", type=int, default=CAMERA_INDEX, help=f"Camera index (default: {CAMERA_INDEX})")
+    args = parser.parse_args()
+    
+    v_key = "v2" if args.model_version in ["v2", "2"] else "v1"
+    run_ml_auto_alignment(model_version=v_key, duet_ip=args.ip, camera_index=args.cam)

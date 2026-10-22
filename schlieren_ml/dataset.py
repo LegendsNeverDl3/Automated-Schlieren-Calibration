@@ -10,16 +10,17 @@ class SchlierenDataset(Dataset):
     PyTorch Dataset for 2-channel Spatio-Temporal Schlieren images.
     
     Loads:
-      - Channel 0: Temporal Mean image (normalized to [0, 1])
+      - Channel 0: Temporal Mean image (normalized to [0, 1], with optional CLAHE)
       - Channel 1: Temporal Variance map (normalized to [0, 1])
       - Label 1: Continuous Quality Score Q in [0.0, 1.0] (float32)
       - Label 2: Cutoff Regime class index in {0: Under, 1: Optimal, 2: Over} (int64)
     """
-    def __init__(self, manifest_df, base_dir="", is_train=True, img_size=(128, 128)):
+    def __init__(self, manifest_df, base_dir="", is_train=True, img_size=(128, 128), use_clahe=False):
         self.df = manifest_df.reset_index(drop=True)
         self.base_dir = base_dir
         self.is_train = is_train
         self.img_size = img_size
+        self.use_clahe = use_clahe
 
     def __len__(self):
         return len(self.df)
@@ -44,11 +45,15 @@ class SchlierenDataset(Dataset):
             mean_img = cv2.resize(mean_img, self.img_size, interpolation=cv2.INTER_AREA)
             var_img = cv2.resize(var_img, self.img_size, interpolation=cv2.INTER_AREA)
             
-        # Strip out global DC background illumination via CLAHE local contrast equalization
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        mean_clahe = clahe.apply(mean_img)
-        
-        mean_f = mean_clahe.astype(np.float32) / 255.0
+        if self.use_clahe:
+            # Version 2: Local contrast normalization via CLAHE
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            mean_proc = clahe.apply(mean_img)
+        else:
+            # Version 1: Raw linear mean image
+            mean_proc = mean_img
+            
+        mean_f = mean_proc.astype(np.float32) / 255.0
         var_f = var_img.astype(np.float32) / 255.0
         
         # Training Augmentations
@@ -60,10 +65,16 @@ class SchlierenDataset(Dataset):
             mean_f = cv2.warpAffine(mean_f, M, self.img_size, borderMode=cv2.BORDER_REFLECT)
             var_f = cv2.warpAffine(var_f, M, self.img_size, borderMode=cv2.BORDER_REFLECT)
             
-            # 2. Aggressive illumination invariance (forces AI to ignore overall brightness)
-            scale = np.random.uniform(0.65, 1.35)
-            bias = np.random.uniform(-0.15, 0.15)
-            mean_f = np.clip(mean_f * scale + bias, 0.0, 1.0)
+            # 2. Illumination scaling (simulate beam splitter light fluctuations)
+            if self.use_clahe:
+                # Aggressive illumination invariance for CLAHE model
+                scale = np.random.uniform(0.65, 1.35)
+                bias = np.random.uniform(-0.15, 0.15)
+                mean_f = np.clip(mean_f * scale + bias, 0.0, 1.0)
+            else:
+                # Moderate illumination scaling for baseline model
+                scale = np.random.uniform(0.85, 1.15)
+                mean_f = np.clip(mean_f * scale, 0.0, 1.0)
             
             # 3. Additive Gaussian noise
             noise = np.random.normal(0, 0.015, self.img_size).astype(np.float32)
@@ -73,8 +84,8 @@ class SchlierenDataset(Dataset):
         stacked = np.stack([mean_f, var_f], axis=0)
         tensor_x = torch.from_numpy(stacked)
         
-        quality = torch.tensor(float(row.get("quality_score", 0.0)), dtype=torch.float32)
-        regime = torch.tensor(int(row.get("regime_label", 0)), dtype=torch.long)
+        quality = torch.tensor([float(row["quality_score"])], dtype=torch.float32)
+        regime = torch.tensor(int(row["regime_label"]), dtype=torch.long)
         
         metadata = {
             "motor_x": float(row.get("motor_x", 0.0)),
@@ -83,7 +94,7 @@ class SchlierenDataset(Dataset):
         
         return tensor_x, quality, regime, metadata
 
-def get_dataloaders(manifest_csv_path, batch_size=16, val_ratio=0.2, seed=42):
+def get_dataloaders(manifest_csv_path, batch_size=16, val_ratio=0.2, seed=42, use_clahe=False):
     """Factory to create train and validation DataLoaders from a manifest CSV."""
     if not os.path.exists(manifest_csv_path):
         raise FileNotFoundError(f"Manifest CSV not found at: {manifest_csv_path}")
@@ -102,8 +113,8 @@ def get_dataloaders(manifest_csv_path, batch_size=16, val_ratio=0.2, seed=42):
     train_df = df.iloc[train_indices].reset_index(drop=True)
     val_df = df.iloc[val_indices].reset_index(drop=True)
     
-    train_dataset = SchlierenDataset(train_df, base_dir=base_dir, is_train=True)
-    val_dataset = SchlierenDataset(val_df, base_dir=base_dir, is_train=False)
+    train_dataset = SchlierenDataset(train_df, base_dir=base_dir, is_train=True, use_clahe=use_clahe)
+    val_dataset = SchlierenDataset(val_df, base_dir=base_dir, is_train=False, use_clahe=use_clahe)
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)

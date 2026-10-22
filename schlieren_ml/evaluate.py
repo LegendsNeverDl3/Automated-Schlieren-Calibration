@@ -2,6 +2,7 @@ import os
 import sys
 import cv2
 import time
+import argparse
 import torch
 import numpy as np
 from collections import deque
@@ -10,7 +11,8 @@ from model import SpatioTemporalWaveNet
 
 # --- CONFIGURATION ---
 CAMERA_INDEX = 1
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "best_model.pth")
+MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
+
 REGIME_NAMES = ["Under-Cutoff", "Optimal Cutoff", "Over-Cutoff"]
 REGIME_COLORS = [(0, 165, 255), (0, 255, 0), (0, 0, 255)]  # Orange, Green, Red
 
@@ -38,30 +40,43 @@ def detect_mirror_and_chamber(cap):
     
     return (cx, cy, rad), (x1, y1, x2, y2)
 
-def run_live_evaluation():
+def run_live_evaluation(model_version="v1", camera_index=CAMERA_INDEX):
     """Runs real-time ML evaluation on live camera feed without commanding motor movements."""
-    print("Initializing Live ML Wave Evaluator (Passive Diagnostic Mode)...")
+    use_v2 = (model_version.lower() in ["v2", "2"])
+    version_label = "v2 (CLAHE Contrast Normalized)" if use_v2 else "v1 (Raw Baseline, Recommended)"
     
-    if not os.path.exists(MODEL_PATH):
-        print(f"\n[Notice] No trained weights found at: {MODEL_PATH}")
-        print("Using randomly-initialized model for pipeline demonstration.")
-        print("Run 'python train.py' once you collect data to evaluate trained weights!\n")
-        checkpoint = None
+    if use_v2:
+        model_path = os.path.join(MODELS_DIR, "best_model_v2.pth")
     else:
-        print(f"Loading trained model checkpoint from: {MODEL_PATH}")
-        checkpoint = torch.load(MODEL_PATH, map_location="cpu")
-        
-    model = SpatioTemporalWaveNet()
-    if checkpoint is not None:
-        model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
+        model_path = os.path.join(MODELS_DIR, "best_model_v1.pth")
+        if not os.path.exists(model_path):
+            model_path = os.path.join(MODELS_DIR, "best_model.pth")
+            
+    use_clahe = use_v2
     
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-    if not cap.isOpened():
-        print(f"Error: Could not open camera {CAMERA_INDEX}.")
+    print("\n" + "="*70)
+    print("--- LIVE ML SCHLIEREN EVALUATOR (PASSIVE DIAGNOSTIC MODE) ---")
+    print(f"  Configuration : {version_label}")
+    print(f"  Model Path    : {model_path}")
+    print(f"  Preprocessing : {'CLAHE Normalized' if use_clahe else 'Raw Inputs (No CLAHE)'}")
+    print("="*70 + "\n")
+    
+    if not os.path.exists(model_path):
+        print(f"[Error] Model checkpoint not found at: {model_path}")
         sys.exit(1)
         
-    window_name = "Live ML Schlieren Evaluator (Passive)"
+    checkpoint = torch.load(model_path, map_location="cpu")
+    model = SpatioTemporalWaveNet()
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+    print("[AI] SpatioTemporalWaveNet ready on CPU.")
+    
+    cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        print(f"Error: Could not open camera {camera_index}.")
+        sys.exit(1)
+        
+    window_name = f"Live ML Schlieren Evaluator [{model_version.upper()}]"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, 1280, 960)
     
@@ -69,13 +84,13 @@ def run_live_evaluation():
     if chamber_bbox is None:
         print("Error: Could not detect mirror. Ensure camera view is unobstructed.")
         cap.release()
-        return
+        sys.exit(1)
         
     cx, cy, rad = mirror_geom
     x1, y1, x2, y2 = chamber_bbox
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     
     buffer = deque(maxlen=8)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     
     print("\n--- Live Evaluator Running ---")
     print("Press 'Q' or ESC in the camera window to exit.\n")
@@ -106,8 +121,13 @@ def run_live_evaluation():
             sx[:, max(0, mid_rel - 18) : min(sx.shape[1], mid_rel + 18)] = 0
             classic_score = float(np.var(sx))
             
-            # Prepare tensor for ML inference with CLAHE contrast normalization
-            m_res = cv2.resize(echamber, (128, 128)).astype(np.float32) / 255.0
+            # Prepare tensor for ML inference
+            if use_clahe:
+                mean_in = clahe.apply(mean_map)
+            else:
+                mean_in = mean_map
+                
+            m_res = cv2.resize(mean_in, (128, 128)).astype(np.float32) / 255.0
             v_res = cv2.resize(var_norm, (128, 128)).astype(np.float32) / 255.0
             tensor_x = torch.from_numpy(np.stack([m_res, v_res], axis=0)).unsqueeze(0)
             
@@ -129,18 +149,20 @@ def run_live_evaluation():
         
         # HUD Panel (Semi-transparent)
         overlay = display.copy()
-        cv2.rectangle(overlay, (10, 10), (450, 115), (20, 20, 20), -1)
+        cv2.rectangle(overlay, (10, 10), (520, 135), (20, 20, 20), -1)
         cv2.addWeighted(overlay, 0.65, display, 0.35, 0, display)
-        cv2.rectangle(display, (10, 10), (450, 115), (120, 120, 120), 1)
+        cv2.rectangle(display, (10, 10), (520, 135), (120, 120, 120), 1)
         
         regime_text = REGIME_NAMES[ml_regime_idx]
         regime_color = REGIME_COLORS[ml_regime_idx]
         
-        cv2.putText(display, f"ML QUALITY SCORE : {ml_quality:.3f} / 1.0", (20, 38), 
+        cv2.putText(display, f"VERSION: {version_label}", (20, 32), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 215, 255), 1)
+        cv2.putText(display, f"ML QUALITY SCORE : {ml_quality:.3f} / 1.0", (20, 62), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
-        cv2.putText(display, f"REGIME: {regime_text} ({ml_confidence:.1f}%)", (20, 68), 
+        cv2.putText(display, f"REGIME: {regime_text} ({ml_confidence:.1f}%)", (20, 92), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.60, regime_color, 2)
-        cv2.putText(display, f"CLASSICAL SCORE  : {classic_score:.1f}", (20, 98), 
+        cv2.putText(display, f"CLASSICAL SCORE  : {classic_score:.1f}", (20, 122), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
         
         cv2.imshow(window_name, display)
@@ -153,4 +175,11 @@ def run_live_evaluation():
     print("Evaluator exited cleanly.")
 
 if __name__ == "__main__":
-    run_live_evaluation()
+    parser = argparse.ArgumentParser(description="Live Passive ML Wave Evaluator")
+    parser.add_argument("--model-version", "--version", "-v", choices=["v1", "1", "v2", "2"], default="v1",
+                        help="Model version: 'v1' (Raw baseline, default) or 'v2' (CLAHE normalized)")
+    parser.add_argument("--cam", type=int, default=CAMERA_INDEX, help=f"Camera index (default: {CAMERA_INDEX})")
+    args = parser.parse_args()
+    
+    v_key = "v2" if args.model_version in ["v2", "2"] else "v1"
+    run_live_evaluation(model_version=v_key, camera_index=args.cam)

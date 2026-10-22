@@ -1,4 +1,5 @@
 import os
+import argparse
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
@@ -11,26 +12,40 @@ from dataset import get_dataloaders
 # --- HYPERPARAMETERS ---
 MANIFEST_PATH = os.path.join(os.path.dirname(__file__), "dataset", "dataset_manifest.csv")
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
-BEST_MODEL_PATH = os.path.join(MODELS_DIR, "best_model.pth")
 CURVES_PLOT_PATH = os.path.join(MODELS_DIR, "training_curves.png")
 
 os.makedirs(MODELS_DIR, exist_ok=True)
 
-def train_model(epochs=50, batch_size=16, lr=1e-3, val_split=0.2):
+def train_model(epochs=50, batch_size=16, lr=1e-3, val_split=0.2, model_version="v1"):
+    use_v2 = (model_version.lower() in ["v2", "2"])
+    version_label = "Version 2 (CLAHE Normalized)" if use_v2 else "Version 1 (Raw Baseline)"
+    
+    if use_v2:
+        best_model_target = os.path.join(MODELS_DIR, "best_model_v2.pth")
+    else:
+        best_model_target = os.path.join(MODELS_DIR, "best_model_v1.pth")
+        
+    print("\n" + "="*70)
+    print(f"--- TRAINING SPATIO-TEMPORAL WAVENET [{version_label.upper()}] ---")
+    print(f"  Target Checkpoint : {best_model_target}")
+    print(f"  Preprocessing     : {'CLAHE Enabled' if use_v2 else 'Raw Linear Inputs'}")
+    print("="*70 + "\n")
+    
     if not os.path.exists(MANIFEST_PATH):
         print(f"[Error] Dataset manifest not found at: {MANIFEST_PATH}")
-        print("Run 'python data_collector.py' or 'python ingest_archival_videos.py' first to collect data!")
+        print("Run 'python data_collector.py' first to collect sweep data!")
         return
         
     print(f"Loading dataset from: {MANIFEST_PATH}")
-    train_loader, val_loader = get_dataloaders(MANIFEST_PATH, batch_size=batch_size, val_ratio=val_split)
+    train_loader, val_loader = get_dataloaders(
+        MANIFEST_PATH, batch_size=batch_size, val_ratio=val_split, use_clahe=use_v2
+    )
     print(f"Train samples: {len(train_loader.dataset)} | Val samples: {len(val_loader.dataset)}")
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on device: {device}")
     
     # --- HANDLE DATASET SKEW / CLASS IMBALANCE ---
-    # 1. Compute inverse-frequency class weights for CrossEntropyLoss
     regime_counts = [0, 0, 0]
     for _, _, r, _ in train_loader.dataset:
         regime_counts[r.item()] += 1
@@ -49,74 +64,63 @@ def train_model(epochs=50, batch_size=16, lr=1e-3, val_split=0.2):
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
     
-    history = {
-        "train_loss": [], "val_loss": [],
-        "val_mse": [], "val_acc": []
-    }
-    
     best_val_loss = float("inf")
-    
-    print("\n" + "="*60)
-    print("--- STARTING SPATIO-TEMPORAL WAVENET TRAINING ---")
-    print("="*60)
+    history = {"train_loss": [], "val_loss": [], "val_mse": [], "val_acc": []}
     
     for epoch in range(1, epochs + 1):
-        # 1. Training Phase
+        # 1. Train Step
         model.train()
-        train_loss_accum = 0.0
+        train_loss = 0.0
         
-        for batch_x, target_q, target_r, _ in train_loader:
+        for batch_x, batch_q, batch_r, _ in train_loader:
             batch_x = batch_x.to(device)
-            target_q = target_q.to(device)
-            target_r = target_r.to(device)
+            batch_q = batch_q.to(device)
+            batch_r = batch_r.to(device)
             
             optimizer.zero_grad()
             pred_q, pred_r = model(batch_x)
             
-            # Peak-Weighted MSE: Heavily penalizes errors on rare 'Optimal' wave samples
-            # (Errors on Q=1.0 count 4x more than errors on Q=0.0)
-            q_weights = 1.0 + 3.0 * target_q
-            loss_q = torch.mean(q_weights * (pred_q - target_q) ** 2)
+            # 4x penalty on high-quality samples to combat skew
+            weight_mask = 1.0 + 3.0 * (batch_q > 0.40).float()
+            loss_mse = torch.mean(weight_mask * (pred_q - batch_q) ** 2)
+            loss_ce = ce_criterion(pred_r, batch_r)
             
-            loss_r = ce_criterion(pred_r, target_r)
-            total_loss = loss_q + 1.0 * loss_r
-            
-            total_loss.backward()
+            loss = loss_mse + 0.5 * loss_ce
+            loss.backward()
             optimizer.step()
             
-            train_loss_accum += total_loss.item() * len(batch_x)
+            train_loss += loss.item() * len(batch_x)
             
         scheduler.step()
-        train_loss = train_loss_accum / len(train_loader.dataset)
+        train_loss /= len(train_loader.dataset)
         
-        # 2. Validation Phase
+        # 2. Validation Step
         model.eval()
-        val_loss_accum = 0.0
-        val_mse_accum = 0.0
+        val_loss = 0.0
+        val_mse = 0.0
         correct_regime = 0
-        total_val = 0
+        total_val = len(val_loader.dataset)
         
         with torch.no_grad():
-            for batch_x, target_q, target_r, _ in val_loader:
+            for batch_x, batch_q, batch_r, _ in val_loader:
                 batch_x = batch_x.to(device)
-                target_q = target_q.to(device)
-                target_r = target_r.to(device)
+                batch_q = batch_q.to(device)
+                batch_r = batch_r.to(device)
                 
                 pred_q, pred_r = model(batch_x)
                 
-                loss_q = mse_criterion(pred_q, target_q)
-                loss_r = ce_criterion(pred_r, target_r)
-                total_loss = loss_q + 0.5 * loss_r
+                loss_mse = mse_criterion(pred_q, batch_q)
+                loss_ce = ce_criterion(pred_r, batch_r)
+                loss = loss_mse + 0.5 * loss_ce
                 
-                val_loss_accum += total_loss.item() * len(batch_x)
-                val_mse_accum += loss_q.item() * len(batch_x)
+                val_loss += loss.item() * len(batch_x)
+                val_mse += loss_mse.item() * len(batch_x)
                 
                 preds_class = torch.argmax(pred_r, dim=1)
-                correct_regime += (preds_class == target_r).sum().item()
-                total_val += len(batch_x)
+                correct_regime += (preds_class == batch_r).sum().item()
                 
-        val_loss = val_loss_accum / total_val if total_val > 0 else 0.0
-        val_mse = val_mse_accum / total_val if total_val > 0 else 0.0
+        val_loss /= total_val
+        val_mse /= total_val
         val_acc = (correct_regime / total_val * 100.0) if total_val > 0 else 0.0
         
         history["train_loss"].append(train_loss)
@@ -127,14 +131,19 @@ def train_model(epochs=50, batch_size=16, lr=1e-3, val_split=0.2):
         is_best = val_loss < best_val_loss
         if is_best:
             best_val_loss = val_loss
-            torch.save({
+            ckpt_dict = {
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "best_val_loss": best_val_loss,
                 "val_mse": val_mse,
-                "val_acc": val_acc
-            }, BEST_MODEL_PATH)
+                "val_acc": val_acc,
+                "model_version": "v2" if use_v2 else "v1"
+            }
+            torch.save(ckpt_dict, best_model_target)
+            if not use_v2:
+                # Also save to default best_model.pth
+                torch.save(ckpt_dict, os.path.join(MODELS_DIR, "best_model.pth"))
             save_star = " [BEST MODEL SAVED]"
         else:
             save_star = ""
@@ -142,7 +151,7 @@ def train_model(epochs=50, batch_size=16, lr=1e-3, val_split=0.2):
         print(f"Epoch {epoch:02d}/{epochs:02d} | Train: {train_loss:.4f} | Val: {val_loss:.4f} | Val MSE: {val_mse:.4f} | Regime Acc: {val_acc:.1f}%{save_star}")
         
     print("\n" + "="*60)
-    print(f"Training Complete! Best model saved to: {BEST_MODEL_PATH}")
+    print(f"Training Complete! Best model saved to: {best_model_target}")
     print(f"Final Best Val Loss: {best_val_loss:.4f}")
     
     # Plot Training Curves
@@ -150,7 +159,7 @@ def train_model(epochs=50, batch_size=16, lr=1e-3, val_split=0.2):
     plt.subplot(1, 2, 1)
     plt.plot(history["train_loss"], label="Train Loss")
     plt.plot(history["val_loss"], label="Val Loss")
-    plt.title("Multi-Task Loss")
+    plt.title(f"Multi-Task Loss ({version_label})")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.legend()
@@ -158,7 +167,7 @@ def train_model(epochs=50, batch_size=16, lr=1e-3, val_split=0.2):
     
     plt.subplot(1, 2, 2)
     plt.plot(history["val_acc"], label="Regime Accuracy (%)", color="green")
-    plt.title("Validation Regime Accuracy")
+    plt.title(f"Validation Regime Accuracy ({version_label})")
     plt.xlabel("Epoch")
     plt.ylabel("Accuracy (%)")
     plt.legend()
@@ -169,11 +178,13 @@ def train_model(epochs=50, batch_size=16, lr=1e-3, val_split=0.2):
     print(f"Saved training curve plot to: {CURVES_PLOT_PATH}")
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=35)
+    parser = argparse.ArgumentParser(description="Train SpatioTemporalWaveNet")
+    parser.add_argument("--version", "-v", "--model-version", choices=["v1", "1", "v2", "2"], default="v1",
+                        help="Model version to train: 'v1' / '1' (Raw baseline, default) or 'v2' / '2' (CLAHE normalized)")
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-3)
     args = parser.parse_args()
     
-    train_model(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr)
+    v_key = "v2" if args.version in ["v2", "2"] else "v1"
+    train_model(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, model_version=v_key)
