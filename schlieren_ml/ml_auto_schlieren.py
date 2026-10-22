@@ -24,8 +24,8 @@ CAMERA_INDEX = 1
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
 
 # Search parameters
-START_X = 48.600
-MAX_X = 50.400
+START_X = 49.300
+MAX_X = 49.800
 STEP_SIZE = 0.020          # 20 micron steps for smooth peak profiling
 CORRIDOR_THRESHOLD = 0.50   # Minimum score to consider entering sweet spot
 MIN_DROPS_TO_CONFIRM = 3    # Number of consecutive decreasing readings to confirm peak is passed
