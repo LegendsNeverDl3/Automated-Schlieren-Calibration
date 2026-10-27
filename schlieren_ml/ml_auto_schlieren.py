@@ -79,13 +79,13 @@ def detect_mirror_and_chamber(cap):
     print(f"[Optics] Chamber ROI: X=[{x1}, {x2}], Y=[{y1}, {y2}] ({x2-x1}x{y2-y1} px)")
     return (cx, cy, rad), (x1, y1, x2, y2)
 
-def capture_burst_and_evaluate(cap, chamber_bbox, model, num_frames=10, use_clahe=False):
+def capture_burst_and_evaluate(cap, chamber_bbox, model, num_frames=10, flush_frames=4, use_clahe=False):
     """Flushes driver buffers, grabs burst frames, and runs neural network inference."""
     x1, y1, x2, y2 = chamber_bbox
     frames = []
     
     # 1. Flush stale USB camera driver queue
-    for _ in range(6): cap.grab()
+    for _ in range(flush_frames): cap.grab()
     
     # 2. Capture consecutive frames
     for _ in range(num_frames):
@@ -94,7 +94,7 @@ def capture_burst_and_evaluate(cap, chamber_bbox, model, num_frames=10, use_clah
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         chamber_crop = gray[y1:y2, x1:x2]
         frames.append(chamber_crop)
-        time.sleep(0.015)
+        time.sleep(0.012)
         
     if len(frames) < 3:
         raise RuntimeError("Insufficient frames captured in burst.")
@@ -159,9 +159,12 @@ def draw_hud(display, curr_x, quality, regime_idx, confidence, stage_text, cx, c
     cv2.rectangle(display, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), (0, 255, 0), -1)
     cv2.rectangle(display, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (255, 255, 255), 1)
 
-def run_ml_auto_alignment(model_version="v1", duet_ip=DUET_IP, camera_index=CAMERA_INDEX):
+def run_ml_auto_alignment(model_version="v1", duet_ip=DUET_IP, camera_index=CAMERA_INDEX, clean_mode=False):
+    t_start = time.time()
+    mode_title = "CLEAN DIRECT MODE (NO GUI WINDOW)" if clean_mode else "STANDARD GUI WINDOW MODE"
     print("\n" + "="*70)
-    print("--- ML-GUIDED CLOSED-LOOP SCHLIEREN AUTO-ALIGNMENT ---")
+    print(f"--- ML-GUIDED CLOSED-LOOP SCHLIEREN AUTO-ALIGNMENT ---")
+    print(f"[{mode_title}]")
     print("="*70)
     
     # Configure model and preprocessing based on version
@@ -180,6 +183,7 @@ def run_ml_auto_alignment(model_version="v1", duet_ip=DUET_IP, camera_index=CAME
     print(f"[AI] Active Configuration: {v_label}")
     print(f"[AI] Model Path: {model_path}")
     print(f"[AI] Preprocessing: {'CLAHE enabled' if use_clahe else 'Raw inputs (no CLAHE)'}")
+    print(f"[Display] {'CLEAN MODE: Headless (no window overhead, straight to robotic motion)' if clean_mode else 'WINDOW MODE: Live HUD enabled'}")
     print(f"[Safety] Minimum lock threshold: Q >= {MIN_QUALITY_TO_LOCK}")
     
     # 1. Load Trained Neural Network
@@ -202,9 +206,10 @@ def run_ml_auto_alignment(model_version="v1", duet_ip=DUET_IP, camera_index=CAME
     if not cap.isOpened():
         raise RuntimeError(f"Could not open camera index {camera_index}")
         
-    window_name = f"ML Auto-Schlieren Closed-Loop Alignment [{model_version.upper()}]"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window_name, 1200, 850)
+    window_name = "ML Auto-Schlieren Closed-Loop Alignment"
+    if not clean_mode:
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, 1200, 850)
     
     try:
         mirror_geom, chamber_bbox = detect_mirror_and_chamber(cap)
@@ -220,7 +225,7 @@ def run_ml_auto_alignment(model_version="v1", duet_ip=DUET_IP, camera_index=CAME
         
         duet.move_x_absolute(START_X)
         duet.wait_for_move()
-        time.sleep(0.5)
+        time.sleep(0.4)
         
         curr_x = START_X
         all_xs = []
@@ -235,22 +240,24 @@ def run_ml_auto_alignment(model_version="v1", duet_ip=DUET_IP, camera_index=CAME
         while curr_x <= MAX_X + 1e-4:
             duet.move_x_absolute(curr_x)
             duet.wait_for_move()
-            time.sleep(0.20)  # Settle mechanical vibrations
+            time.sleep(0.20)  # Full mechanical settle for high accuracy
             
             q, reg_idx, conf, mean_map, var_map = capture_burst_and_evaluate(
-                cap, chamber_bbox, model, num_frames=10, use_clahe=use_clahe
+                cap, chamber_bbox, model, num_frames=10, flush_frames=4, use_clahe=use_clahe
             )
             all_xs.append(curr_x)
             all_qs.append(q)
             
-            # Render HUD
-            ret, full_frame = cap.read()
-            if not ret: full_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-            display = full_frame.copy()
-            status_text = "Hunting for Peak..." if consecutive_drops == 0 else f"Confirming Negative Slope ({consecutive_drops}/{MIN_DROPS_TO_CONFIRM})"
-            draw_hud(display, curr_x, q, reg_idx, conf, f"Forward Sweep [{model_version.upper()}] ({status_text})", cx, cy, rad, chamber_bbox)
-            cv2.imshow(window_name, display)
-            cv2.waitKey(1)
+            # Optional GUI render
+            if not clean_mode:
+                ret, full_frame = cap.read()
+                if not ret: full_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                display = full_frame.copy()
+                status_text = "Hunting for Peak..." if consecutive_drops == 0 else f"Confirming Negative Slope ({consecutive_drops}/{MIN_DROPS_TO_CONFIRM})"
+                hud_label = f"Sweep [{model_version.upper()}] ({status_text})"
+                draw_hud(display, curr_x, q, reg_idx, conf, hud_label, cx, cy, rad, chamber_bbox)
+                cv2.imshow(window_name, display)
+                cv2.waitKey(1)
             
             print(f"  X={curr_x:.3f} mm | Quality: {q:.4f} | Regime: {REGIME_NAMES[reg_idx]} ({conf:.1f}%) | Peak: {peak_q:.4f} (at {peak_x:.3f} mm)")
             
@@ -295,17 +302,18 @@ def run_ml_auto_alignment(model_version="v1", duet_ip=DUET_IP, camera_index=CAME
             print("!"*70 + "\n")
             move_x_unidirectional(duet, START_X)
             
-            ret, full_frame = cap.read()
-            display = full_frame.copy() if ret else np.zeros((480, 640, 3), dtype=np.uint8)
-            draw_hud(display, START_X, peak_q, 0, 0.0, "ABORTED: LOW CONFIDENCE", cx, cy, rad, chamber_bbox)
-            cv2.rectangle(display, (display.shape[1] - 370, 10), (display.shape[1] - 10, 75), (0, 0, 200), -1)
-            cv2.putText(display, "ALIGNMENT ABORTED", (display.shape[1] - 355, 38), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-            cv2.putText(display, f"Peak Q {peak_q:.2f} < {MIN_QUALITY_TO_LOCK}", (display.shape[1] - 355, 60), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 255), 1)
-            cv2.imshow(window_name, display)
-            print("Press any key in the camera window to exit.")
-            cv2.waitKey(0)
+            if not clean_mode:
+                ret, full_frame = cap.read()
+                display = full_frame.copy() if ret else np.zeros((480, 640, 3), dtype=np.uint8)
+                draw_hud(display, START_X, peak_q, 0, 0.0, "ABORTED: LOW CONFIDENCE", cx, cy, rad, chamber_bbox)
+                cv2.rectangle(display, (display.shape[1] - 370, 10), (display.shape[1] - 10, 75), (0, 0, 200), -1)
+                cv2.putText(display, "ALIGNMENT ABORTED", (display.shape[1] - 355, 38), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+                cv2.putText(display, f"Peak Q {peak_q:.2f} < {MIN_QUALITY_TO_LOCK}", (display.shape[1] - 355, 60), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 255), 1)
+                cv2.imshow(window_name, display)
+                print("Press any key in the camera window to exit.")
+                cv2.waitKey(0)
             return
             
         # =====================================================================
@@ -342,13 +350,10 @@ def run_ml_auto_alignment(model_version="v1", duet_ip=DUET_IP, camera_index=CAME
         print("STAGE 2: Anti-Backlash Return & Closed-Loop Optical Peak Polish")
         print("="*70)
         
-        # Candidate positions around the peak to eliminate any remaining overshoot / backlash
-        # Prioritize left-shifted points (-0.06 to +0.02 mm) to completely prevent overshooting
         polish_offsets = [-0.060, -0.040, -0.020, 0.000, +0.020]
         test_positions = [optimal_x + off for off in polish_offsets]
         
         print(f"[Anti-Backlash] Retracting left to start unidirectional forward polish...")
-        # Move well past the leftmost candidate to load lead screw in forward (+X) direction
         duet.move_x_absolute(min(test_positions) - 0.250)
         duet.wait_for_move()
         time.sleep(0.4)
@@ -360,22 +365,21 @@ def run_ml_auto_alignment(model_version="v1", duet_ip=DUET_IP, camera_index=CAME
         
         print("\n[Micro-Polish] Stepping forward through peak candidates with 0 microns backlash:")
         for tx in sorted(test_positions):
-            # Always step forward into candidate
             duet.move_x_absolute(tx)
             duet.wait_for_move()
-            time.sleep(0.25)
+            time.sleep(0.20)
             
             lq, lreg, lconf, lmean, lvar = capture_burst_and_evaluate(
-                cap, chamber_bbox, model, num_frames=10, use_clahe=use_clahe
+                cap, chamber_bbox, model, num_frames=10, flush_frames=4, use_clahe=use_clahe
             )
             print(f"  Candidate X={tx:.3f} mm -> Live ML Quality: {lq:.4f} | Regime: {REGIME_NAMES[lreg]} ({lconf:.1f}%)")
             
-            # Update HUD
-            ret, full_frame = cap.read()
-            display = full_frame.copy() if ret else np.zeros((480, 640, 3), dtype=np.uint8)
-            draw_hud(display, tx, lq, lreg, lconf, f"Stage 2: Polish [{model_version.upper()}]", cx, cy, rad, chamber_bbox)
-            cv2.imshow(window_name, display)
-            cv2.waitKey(1)
+            if not clean_mode:
+                ret, full_frame = cap.read()
+                display = full_frame.copy() if ret else np.zeros((480, 640, 3), dtype=np.uint8)
+                draw_hud(display, tx, lq, lreg, lconf, f"Stage 2: Polish [{model_version.upper()}]", cx, cy, rad, chamber_bbox)
+                cv2.imshow(window_name, display)
+                cv2.waitKey(1)
             
             if lq > best_live_q:
                 best_live_q = lq
@@ -383,17 +387,17 @@ def run_ml_auto_alignment(model_version="v1", duet_ip=DUET_IP, camera_index=CAME
                 best_live_reg = lreg
                 best_live_conf = lconf
                 
-        # Drive forward to the confirmed best live position
         print(f"\n[Final Action] Locking knife-edge to best live optical position: X = {best_live_x:.3f} mm...")
         move_x_unidirectional(duet, best_live_x, overshoot_distance=0.200)
         
-        # Grab final locked verification frame
         final_q, final_reg, final_conf, final_mean, _ = capture_burst_and_evaluate(
-            cap, chamber_bbox, model, num_frames=12, use_clahe=use_clahe
+            cap, chamber_bbox, model, num_frames=12, flush_frames=4, use_clahe=use_clahe
         )
         
+        elapsed_sec = time.time() - t_start
         print("\n" + "="*70)
         print("--- ALIGNMENT COMPLETE! SCHLIEREN SYSTEM IS OPTIMIZED ---")
+        print(f"  Execution Time:           {elapsed_sec:.1f} seconds")
         print(f"  Initial Estimated Peak:   {peak_x:.3f} mm")
         print(f"  Final Locked Position:    {best_live_x:.3f} mm")
         print(f"  Correction Applied:       {(best_live_x - peak_x):+.3f} mm")
@@ -401,20 +405,25 @@ def run_ml_auto_alignment(model_version="v1", duet_ip=DUET_IP, camera_index=CAME
         print(f"  Predicted Cutoff Regime:  {REGIME_NAMES[final_reg]} ({final_conf:.1f}% confidence)")
         print("="*70)
         
-        ret, full_frame = cap.read()
-        display = full_frame.copy() if ret else np.zeros((480, 640, 3), dtype=np.uint8)
-        draw_hud(display, best_live_x, final_q, final_reg, final_conf, f"LOCKED [{model_version.upper()}]", cx, cy, rad, chamber_bbox)
-        
-        # Green Locked Badge
-        cv2.rectangle(display, (display.shape[1] - 340, 10), (display.shape[1] - 10, 75), (0, 180, 0), -1)
-        cv2.putText(display, "SYSTEM OPTIMIZED", (display.shape[1] - 325, 38), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-        cv2.putText(display, f"Peak: {final_q:.3f} at {best_live_x:.3f} mm", (display.shape[1] - 325, 60), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 255, 220), 1)
-        
-        cv2.imshow(window_name, display)
-        print("Press any key in the camera window to close and exit.")
-        cv2.waitKey(0)
+        if not clean_mode:
+            ret, full_frame = cap.read()
+            display = full_frame.copy() if ret else np.zeros((480, 640, 3), dtype=np.uint8)
+            draw_hud(display, best_live_x, final_q, final_reg, final_conf, f"LOCKED [{model_version.upper()}]", cx, cy, rad, chamber_bbox)
+            
+            # Green Locked Badge
+            cv2.rectangle(display, (display.shape[1] - 340, 10), (display.shape[1] - 10, 80), (0, 180, 0), -1)
+            cv2.putText(display, "SYSTEM OPTIMIZED", (display.shape[1] - 325, 35), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2)
+            cv2.putText(display, f"Peak: {final_q:.3f} at {best_live_x:.3f} mm", (display.shape[1] - 325, 55), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 255, 220), 1)
+            cv2.putText(display, f"Time: {elapsed_sec:.1f}s", (display.shape[1] - 325, 73), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 255, 200), 1)
+            
+            cv2.imshow(window_name, display)
+            print("Press any key in the camera window to close and exit.")
+            cv2.waitKey(0)
+        else:
+            print("[Clean Mode] Alignment complete and verified. Robotic system locked at sweet spot.")
         
     finally:
         cap.release()
@@ -425,9 +434,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ML-Guided Closed-Loop Schlieren Auto-Alignment")
     parser.add_argument("--model-version", "--version", "-v", choices=["v1", "1", "v2", "2"], default="v1",
                         help="Model version to use: 'v1' / '1' (Raw baseline, default) or 'v2' / '2' (CLAHE normalized)")
+    parser.add_argument("--clean", "-c", action="store_true", default=False,
+                        help="Enable Clean Mode (headless: no camera window, moves straight to robotic testing and exits upon locking)")
     parser.add_argument("--ip", type=str, default=DUET_IP, help=f"Duet 2 IP address (default: {DUET_IP})")
     parser.add_argument("--cam", type=int, default=CAMERA_INDEX, help=f"Camera index (default: {CAMERA_INDEX})")
     args = parser.parse_args()
     
     v_key = "v2" if args.model_version in ["v2", "2"] else "v1"
-    run_ml_auto_alignment(model_version=v_key, duet_ip=args.ip, camera_index=args.cam)
+    run_ml_auto_alignment(model_version=v_key, duet_ip=args.ip, camera_index=args.cam, clean_mode=args.clean)
